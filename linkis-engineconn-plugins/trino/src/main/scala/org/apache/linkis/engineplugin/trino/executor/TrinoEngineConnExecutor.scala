@@ -51,7 +51,7 @@ import org.springframework.util.CollectionUtils
 
 import java.net.URI
 import java.util
-import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.{Callable, ConcurrentHashMap, TimeUnit}
 import java.util._
 import java.util.function.Supplier
 import javax.security.auth.callback.PasswordCallback
@@ -92,6 +92,7 @@ class TrinoEngineConnExecutor(override val outputPrintLimit: Int, val id: Int) e
         }
       }
 
+      logger.info("wds.linkis.trino.ssl.insecured" + TRINO_SSL_INSECURED.getValue)
       /* setup ssl */
       if (TRINO_SSL_INSECURED.getValue) {
         OkHttpUtil.setupInsecureSsl(builder)
@@ -113,18 +114,6 @@ class TrinoEngineConnExecutor(override val outputPrintLimit: Int, val id: Int) e
     super.init
   }
 
-  override def execute(engineConnTask: EngineConnTask): ExecuteResponse = {
-    val user = getCurrentUser(engineConnTask.getLables)
-    val userCreatorLabel = engineConnTask.getLables.find(_.isInstanceOf[UserCreatorLabel]).get
-    val engineTypeLabel = engineConnTask.getLables.find(_.isInstanceOf[EngineTypeLabel]).get
-    var configMap: util.Map[String, String] = null
-    if (userCreatorLabel != null && engineTypeLabel != null) {
-      configMap = TrinoEngineConfig.getCacheMap((userCreatorLabel.asInstanceOf[UserCreatorLabel], engineTypeLabel.asInstanceOf[EngineTypeLabel]))
-    }
-    clientSessionCache.put(engineConnTask.getTaskId, getClientSession(user, engineConnTask.getProperties, configMap))
-    super.execute(engineConnTask)
-  }
-
   override def executeLine(engineExecutorContext: EngineExecutionContext, code: String): ExecuteResponse = {
     val trimmedCode = code.trim
     val realCode = getCodeParser
@@ -134,12 +123,27 @@ class TrinoEngineConnExecutor(override val outputPrintLimit: Int, val id: Int) e
     TrinoCode.checkCode(realCode)
     logger.info(s"trino client begins to run psql code:\n $realCode")
 
+    val currentUser = getCurrentUser(engineExecutorContext.getLabels)
     val trinoUser = Optional.ofNullable(TRINO_USER.getValue)
       .orElseGet(new Supplier[String] {
-        override def get(): String = getCurrentUser(engineExecutorContext.getLabels)
+        override def get(): String = currentUser
       })
     val taskId = engineExecutorContext.getJobId.get
-    val clientSession = clientSessionCache.getIfPresent(taskId)
+    val clientSession = clientSessionCache.get(taskId, new Callable[ClientSession] {
+      override def call(): ClientSession = {
+        val userCreatorLabel = engineExecutorContext.getLabels.find(_.isInstanceOf[UserCreatorLabel]).get
+        val engineTypeLabel = engineExecutorContext.getLabels.find(_.isInstanceOf[EngineTypeLabel]).get
+        var configMap: util.Map[String, String] = null
+        if (userCreatorLabel != null && engineTypeLabel != null) {
+          configMap = Utils.tryAndWarn(
+            TrinoEngineConfig.getCacheMap(
+              (userCreatorLabel.asInstanceOf[UserCreatorLabel], engineTypeLabel.asInstanceOf[EngineTypeLabel])
+            )
+          )
+        }
+        getClientSession(currentUser, engineExecutorContext.getProperties, configMap)
+      }
+    })
     val statement = StatementClientFactory.newStatementClient(
       okHttpClientCache.computeIfAbsent(trinoUser, buildOkHttpClient), clientSession, realCode)
     statementClientCache.put(taskId, statement)
